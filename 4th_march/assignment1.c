@@ -3,205 +3,242 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
-#define META_SIZE 4096  // First 4096 bytes reserved for metadata
+#define META_SIZE 4096  // Metadata size in bytes
 
-typedef struct Super {
-    int n;      // total number of blocks
-    int s;      // size of each block
-    int ubn;    // number of used blocks
-    int fbn;    // number of free blocks
-    // followed by bitmap (ub), each bit represents if a block is used
-} file_info;
+// Helper function to read metadata
+int read_metadata(int fd, int *n, int *s, int *ubn, int *fbn, unsigned char *ub, int bitmap_size) {
+    char meta[META_SIZE];
+    if (lseek(fd, 0, SEEK_SET) < 0 || read(fd, meta, META_SIZE) != META_SIZE) {
+        perror("Failed to read metadata");
+        return -1;
+    }
 
-
-typedef struct File{
-    char content[2048]; 
-}file;
-// Function to write metadata and bitmap to file
-int write_meta(int fd, FileMeta *meta, unsigned char *bitmap) {
-    lseek(fd, 0, SEEK_SET);
-    if (write(fd, meta, sizeof(FileMeta)) != sizeof(FileMeta)) return -1;
-    int bitmap_size = (meta->n + 7) / 8;
-    if (write(fd, bitmap, bitmap_size) != bitmap_size) return -1;
+    *n = *(int *)(meta);
+    *s = *(int *)(meta + 4);
+    *ubn = *(int *)(meta + 8);
+    *fbn = *(int *)(meta + 12);
+    memcpy(ub, meta + 16, bitmap_size);
     return 0;
 }
 
-// Function to read metadata and bitmap from file
-int read_meta(int fd, FileMeta *meta, unsigned char *bitmap) {
-    lseek(fd, 0, SEEK_SET);
-    if (read(fd, meta, sizeof(FileMeta)) != sizeof(FileMeta)) return -1;
-    int bitmap_size = (meta->n + 7) / 8;
-    if (read(fd, bitmap, bitmap_size) != bitmap_size) return -1;
+// Helper function to write metadata
+int write_metadata(int fd, int n, int s, int ubn, int fbn, unsigned char *ub, int bitmap_size) {
+    char meta[META_SIZE];
+    memset(meta, 0, META_SIZE);
+    *(int *)(meta) = n;
+    *(int *)(meta + 4) = s;
+    *(int *)(meta + 8) = ubn;
+    *(int *)(meta + 12) = fbn;
+    memcpy(meta + 16, ub, bitmap_size);
+
+    if (lseek(fd, 0, SEEK_SET) < 0 || write(fd, meta, META_SIZE) != META_SIZE) {
+        perror("Failed to write metadata");
+        return -1;
+    }
     return 0;
 }
 
-
-//Write a function "int init_File_dd(const char *fname, int bsize, int bno)" that creates a file (if it does not exist) called fname of appropriate size (4096 + bsize*bno Bytes) in your folder. The function initializes the first 4096 Byes 
-// putting proper values for n, s, ubn, fbn, and ub. If for some reason this functions fails, it returns -1. Otherwise it returns 0.
-
-
+// Initialize file
 int init_File_dd(const char *fname, int bsize, int bno) {
-   // int fd=open(fname,)
-     int fd = open(fname, O_RDWR | O_CREAT, 0666);
-     if (fd < 0) return -1;
+    int fd = open(fname, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        perror("File open failed");
+        return -1;
+    }
 
-    // int bitmap_size = (bno + 7) / 8;
-    // unsigned char *bitmap = calloc(1, bitmap_size);
-    // if (!bitmap) return -1;
-
-    file_info.n=bno;
-    file_info.s=bsize;
-    file_info.ubn=0;
-    file_info.fbn=bno;
-
-
-
-    // if (write_meta(fd, &meta, bitmap) < 0) {
-    //     free(bitmap);
-    //     close(fd);
-    //     return -1;
-    // }
-
-    // // Expand the file to full size (META_SIZE + bsize * bno)
-    // lseek(fd, META_SIZE + bsize * bno - 1, SEEK_SET);
-    // write(fd, "", 1);
-
-    // free(bitmap);
-    // close(fd);
-    // return 0;
-}
-
-int get_freeblock(const char *fname) {
-    int fd = open(fname, O_RDWR);
-    if (fd < 0) return -1;
-
-    FileMeta meta;
-    unsigned char bitmap[(META_SIZE - sizeof(FileMeta))];
-    if (read_meta(fd, &meta, bitmap) < 0) {
+    off_t total_size = META_SIZE + (off_t)bsize * bno;
+    if (ftruncate(fd, total_size) < 0) {
+        perror("File truncate failed");
         close(fd);
         return -1;
     }
 
-    for (int i = 0; i < meta.n; ++i) {
-        if (!(bitmap[i / 8] & (1 << (i % 8)))) {
-            // Mark block as used
-            bitmap[i / 8] |= (1 << (i % 8));
-            meta.ubn++;
-            meta.fbn--;
+    int bitmap_size = (bno + 7) / 8;
+    unsigned char bitmap[bitmap_size];
+    memset(bitmap, 0, bitmap_size);
 
-            // Write 1's to the block
-            unsigned char *buf = malloc(meta.s);
-            memset(buf, 1, meta.s);
-            lseek(fd, META_SIZE + i * meta.s, SEEK_SET);
-            write(fd, buf, meta.s);
-            free(buf);
+    int res = write_metadata(fd, bno, bsize, 0, bno, bitmap, bitmap_size);
+    close(fd);
+    return res;
+}
 
-            // Update metadata
-            write_meta(fd, &meta, bitmap);
+// Get a free block and mark it used
+int get_freeblock(const char *fname) {
+    int fd = open(fname, O_RDWR);
+    if (fd < 0) {
+        perror("Failed to open file");
+        return -1;
+    }
+
+    int n, s, ubn, fbn;
+    int bitmap_size;
+    unsigned char *bitmap;
+
+    // First read just enough to get n and s
+    char meta_temp[16];
+    read(fd, meta_temp, 16);
+    n = *(int *)(meta_temp);
+    s = *(int *)(meta_temp + 4);
+    ubn = *(int *)(meta_temp + 8);
+    fbn = *(int *)(meta_temp + 12);
+    bitmap_size = (n + 7) / 8;
+
+    bitmap = malloc(bitmap_size);
+    if (!bitmap) {
+        close(fd);
+        return -1;
+    }
+
+    lseek(fd, 0, SEEK_SET);
+    if (read_metadata(fd, &n, &s, &ubn, &fbn, bitmap, bitmap_size) != 0) {
+        free(bitmap);
+        close(fd);
+        return -1;
+    }
+
+    // Find first free block
+    for (int i = 0; i < n; ++i) {
+        int byte = i / 8;
+        int bit = i % 8;
+        if (!(bitmap[byte] & (1 << bit))) {
+            // Mark as used
+            bitmap[byte] |= (1 << bit);
+            ubn++;
+            fbn--;
+
+            // Fill the block with 1's
+            char *data = malloc(s);
+            memset(data, 1, s);
+            lseek(fd, META_SIZE + (off_t)i * s, SEEK_SET);
+            write(fd, data, s);
+            free(data);
+
+            write_metadata(fd, n, s, ubn, fbn, bitmap, bitmap_size);
+            free(bitmap);
             close(fd);
             return i;
         }
     }
 
+    free(bitmap);
     close(fd);
-    return -1; // no free block
+    return -1; // No free block found
 }
 
+// Free a specific block
 int free_block(const char *fname, int bno) {
     int fd = open(fname, O_RDWR);
-    if (fd < 0) return 0;
+    if (fd < 0) {
+        perror("Failed to open file");
+        return 0;
+    }
 
-    FileMeta meta;
-    unsigned char bitmap[(META_SIZE - sizeof(FileMeta))];
-    if (read_meta(fd, &meta, bitmap) < 0) {
+    int n, s, ubn, fbn;
+    int bitmap_size;
+    bitmap_size = (bno + 7) / 8;
+    unsigned char bitmap[bitmap_size];
+
+    if (read_metadata(fd, &n, &s, &ubn, &fbn, bitmap, bitmap_size) != 0) {
         close(fd);
         return 0;
     }
 
-    if (bno < 0 || bno >= meta.n) {
+    if (bno < 0 || bno >= n) {
         close(fd);
         return 0;
     }
 
-    if (!(bitmap[bno / 8] & (1 << (bno % 8)))) {
-        // block already free
-        close(fd);
+    int byte = bno / 8;
+    int bit = bno % 8;
+
+    if (!(bitmap[byte] & (1 << bit))) {
+        close(fd); // Block is already free
         return 0;
     }
 
-    // Mark block as free
-    bitmap[bno / 8] &= ~(1 << (bno % 8));
-    meta.ubn--;
-    meta.fbn++;
+    // Mark as free
+    bitmap[byte] &= ~(1 << bit);
+    ubn--;
+    fbn++;
 
-    // Write 0's to the block
-    unsigned char *buf = calloc(1, meta.s);
-    lseek(fd, META_SIZE + bno * meta.s, SEEK_SET);
-    write(fd, buf, meta.s);
-    free(buf);
+    // Fill with 0s
+    char *data = malloc(s);
+    memset(data, 0, s);
+    lseek(fd, META_SIZE + (off_t)bno * s, SEEK_SET);
+    write(fd, data, s);
+    free(data);
 
-    write_meta(fd, &meta, bitmap);
+    write_metadata(fd, n, s, ubn, fbn, bitmap, bitmap_size);
     close(fd);
     return 1;
 }
 
+// Check file system consistency
 int check_fs(const char *fname) {
     int fd = open(fname, O_RDONLY);
-    if (fd < 0) return 1;
+    if (fd < 0) {
+        perror("Failed to open file");
+        return 1;
+    }
 
-    FileMeta meta;
-    unsigned char bitmap[(META_SIZE - sizeof(FileMeta))];
-    if (read_meta(fd, &meta, bitmap) < 0) {
+    int n, s, ubn, fbn;
+    int bitmap_size;
+    unsigned char *bitmap;
+
+    read(fd, &n, sizeof(int));
+    read(fd, &s, sizeof(int));
+    read(fd, &ubn, sizeof(int));
+    read(fd, &fbn, sizeof(int));
+    bitmap_size = (n + 7) / 8;
+    bitmap = malloc(bitmap_size);
+    if (!bitmap) {
         close(fd);
         return 1;
     }
 
-    int actual_used = 0;
-    for (int i = 0; i < meta.n; ++i) {
-        if (bitmap[i / 8] & (1 << (i % 8))) {
-            actual_used++;
-        }
+    lseek(fd, 16, SEEK_SET);
+    read(fd, bitmap, bitmap_size);
+
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        int byte = i / 8;
+        int bit = i % 8;
+        if (bitmap[byte] & (1 << bit)) count++;
     }
 
-    if (meta.ubn + meta.fbn != meta.n || actual_used != meta.ubn) {
-        close(fd);
-        return 1;
-    }
-
+    free(bitmap);
     close(fd);
+
+    if (ubn + fbn != n || count != ubn) return 1;
     return 0;
 }
 
+// Main demonstration
 int main() {
     const char *filename = "dd1";
+    int block_size = 4096;
+    int block_count = 2048;
 
-    // Initialize file with 2048 blocks of 4096 bytes
-    if (init_File_dd(filename, 4096, 2048) == 0)
-        printf("File initialized successfully.\n");
-    else {
-        perror("Failed to initialize file");
-        return 1;
-    }
+    if (init_File_dd(filename, block_size, block_count) == 0)
+        printf("Initialized file successfully.\n");
 
-    // Allocate a block
     int blk = get_freeblock(filename);
     if (blk >= 0)
         printf("Allocated block: %d\n", blk);
     else
         printf("No free block available.\n");
 
-    // Free that block
     if (free_block(filename, blk))
-        printf("Block %d freed successfully.\n", blk);
+        printf("Freed block: %d\n", blk);
     else
-        printf("Failed to free block %d.\n", blk);
+        printf("Failed to free block.\n");
 
-    // Check file system integrity
     if (check_fs(filename) == 0)
-        printf("Filesystem integrity: OK.\n");
+        printf("File system is consistent.\n");
     else
-        printf("Filesystem check failed!\n");
+        printf("File system inconsistency detected!\n");
 
     return 0;
 }
