@@ -5,7 +5,7 @@
  #include <unistd.h>
 
  #include <sys/wait.h>
-
+#include <unistd.h>
 
 
 int main() {
@@ -26,7 +26,11 @@ int main() {
 
             input[strcspn(input, "\n")] = 0;
 
-            printf("you entered : %s\n ",input);
+            printf("you entered the file name -----> : %s\n ",input);
+            
+            char *myargv[]={input,NULL};
+            
+            execve(input,myargv,NULL);
 
         }
 
